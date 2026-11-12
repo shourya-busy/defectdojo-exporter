@@ -187,6 +187,16 @@ func CollectMetrics(link, token string, refreshToken func() (string, error), con
 					return
 				}
 
+				// A product moved to another product type would otherwise keep
+				// exporting its old series under the old product_type label.
+				defectdojo.MU.Lock()
+				if old, ok := defectdojo.ProductTypes[product]; ok && old != productType {
+					log.Printf("Product %s moved from product type %q to %q, dropping its old series", product, old, productType)
+					defectdojo.ForgetProduct(product)
+				}
+				defectdojo.ProductTypes[product] = productType
+				defectdojo.MU.Unlock()
+
 				vulnerabilities, err := defectdojo.FetchVulnerabilities(product, link, token, timeout)
 				if err != nil {
 					log.Printf("Error fetching vulnerabilities for product %s: %v", product, err)
@@ -270,14 +280,53 @@ func CollectMetrics(link, token string, refreshToken func() (string, error), con
 				updateBySeverity(defectdojo.VulnFixTimeDaysSumGauge, defectdojo.PrevFixTimeSum, agg.fixTimeDaysSum)
 				updateBySeverity(defectdojo.VulnFixTimeDaysCountGauge, defectdojo.PrevFixTimeCount, agg.fixTimeDaysCount)
 
+				ensureProductPresence(product, productType)
+
 			}(p.Name, p.ID, p.Type)
 		}
 		wg.Wait()
+
+		pruneProducts(products)
 
 		// Wait for the next tick. If the iteration took longer than the
 		// interval, a tick is already buffered and collection resumes
 		// immediately without building up a backlog.
 		<-ticker.C
+	}
+}
+
+// ensureProductPresence exports a zero-valued active series for a product that
+// has never had an active finding, so clean products (e.g. a host whose scan
+// found nothing) still show up as scanned in coverage queries instead of being
+// indistinguishable from products that were never scanned.
+func ensureProductPresence(product, productType string) {
+	defectdojo.MU.Lock()
+	defer defectdojo.MU.Unlock()
+	if len(defectdojo.PrevActive[product]) > 0 {
+		return
+	}
+	if defectdojo.PrevActive[product] == nil {
+		defectdojo.PrevActive[product] = make(map[string]float64)
+	}
+	defectdojo.VulnActiveGauge.WithLabelValues(product, productType, "info", "0").Set(0)
+	defectdojo.PrevActive[product]["info|0"] = 0
+}
+
+// pruneProducts drops the series of every product the exporter still holds
+// state for but that DefectDojo no longer returns (deleted or renamed).
+// Only called after a successful product listing.
+func pruneProducts(products []defectdojo.Product) {
+	current := make(map[string]bool, len(products))
+	for _, p := range products {
+		current[p.Name] = true
+	}
+	defectdojo.MU.Lock()
+	defer defectdojo.MU.Unlock()
+	for name := range defectdojo.KnownProducts() {
+		if !current[name] {
+			log.Printf("Product %s no longer exists in DefectDojo, dropping its series", name)
+			defectdojo.ForgetProduct(name)
+		}
 	}
 }
 
