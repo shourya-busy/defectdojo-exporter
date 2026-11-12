@@ -108,3 +108,58 @@ var (
 )
 
 var MU sync.Mutex
+
+// ProductTypes remembers the product_type label last exported for each
+// product, so a product's series can be dropped when it is deleted from
+// DefectDojo or moved to another product type. Guarded by MU.
+var ProductTypes = make(map[string]string)
+
+// AllGauges lists every per-product metric this exporter exposes.
+func AllGauges() []*prometheus.GaugeVec {
+	return []*prometheus.GaugeVec{
+		VulnActiveGauge, VulnDuplicateGauge, VulnUnderReviewGauge, VulnFalsePositiveGauge,
+		VulnOutOfScopeGauge, VulnRiskAcceptedGauge, VulnVerifiedGauge, VulnMitigatedGauge,
+		VulnSLABreachedGauge, VulnMitigatedWithinSLAGauge, VulnMitigatedOutsideSLAGauge,
+		VulnFixTimeDaysSumGauge, VulnFixTimeDaysCountGauge,
+	}
+}
+
+func allPrevMaps() []map[string]map[string]float64 {
+	return []map[string]map[string]float64{
+		PrevActive, PrevDuplicate, PrevUnderReview, PrevFalsePositive, PrevOutOfScope,
+		PrevRiskAccepted, PrevVerified, PrevMitigated, PrevSLABreached,
+		PrevWithinSLA, PrevOutsideSLA, PrevFixTimeSum, PrevFixTimeCount,
+	}
+}
+
+// KnownProducts returns every product the exporter currently holds state for.
+// Caller must hold MU.
+func KnownProducts() map[string]bool {
+	known := make(map[string]bool)
+	for p := range ProductTypes {
+		known[p] = true
+	}
+	for p := range PrevEngagementUpdateTimes {
+		known[p] = true
+	}
+	for _, m := range allPrevMaps() {
+		for p := range m {
+			known[p] = true
+		}
+	}
+	return known
+}
+
+// ForgetProduct removes every exported series and all remembered state for a
+// product. Without this, a product that is deleted, renamed or moved to another
+// product type keeps exporting its last values forever. Caller must hold MU.
+func ForgetProduct(product string) {
+	for _, g := range AllGauges() {
+		g.DeletePartialMatch(prometheus.Labels{"product": product})
+	}
+	for _, m := range allPrevMaps() {
+		delete(m, product)
+	}
+	delete(PrevEngagementUpdateTimes, product)
+	delete(ProductTypes, product)
+}
